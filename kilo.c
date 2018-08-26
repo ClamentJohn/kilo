@@ -1,5 +1,9 @@
 /*** includes ***/
 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <termios.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -7,6 +11,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 
 #include <unistd.h>
 
@@ -28,10 +33,18 @@ enum editorKey {
 
 /*** data ***/
 
+/* Editor row, stores a line of text as pointer to dynamically allocate character data and length */
+typedef struct erow {
+    int size;
+    char *chars;
+} erow;
+
 struct editorConfig { //data about the default terminal
     int cx, cy;
     int screenrows;
     int screencols;
+    int numrows;
+    erow *row;
     struct termios orig_termios; //original terminal configs
 };
 struct editorConfig E;
@@ -174,6 +187,42 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
+/*** row operations ***/
+
+void editorAppendRow(char *s, size_t len) {
+    E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.numrows = 1; //set to 1 to indicate erow containsa line that should be displayed
+}
+
+
+/*** file i/o ***/
+
+void editorOpen( char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    linelen = getline(&line, &linecap, fp); //read a line from file pointer, linecap = memory allocated
+    if (linelen != -1) {
+        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
+            linelen--;
+        editorAppendRow(line, linelen);
+
+    }
+    free(line);
+    fclose(fp);
+}
+
+
+
 /*** append buffer ***/
 struct abuf {
     char *b;
@@ -212,21 +261,29 @@ void abFree(struct abuf *ab) {
 void editorDrawRows(struct abuf *ab) {
     int y;
     for (y = 0; y < E.screenrows; y++) {
-        if (y == E.screenrows / 3) {
-            char welcome[80];
-            int welcome_len = snprintf(welcome, sizeof(welcome),
-                                      "Kilo editor -- version %s", KILO_VERSION); //like sprintf, but n = MAX char
-            if (welcome_len > E.screencols) welcome_len = E.screencols;
-            int padding = (E.screencols - welcome_len) / 2;
-            if(padding) {
+        if (y >= E.numrows) {
+            if (E.numrows == 0 && y == E.screenrows / 3) {
+                char welcome[80];
+                int welcome_len = snprintf(welcome, sizeof(welcome),
+                                           "Kilo editor -- version %s", KILO_VERSION); //like sprintf, but n = MAX char
+                if (welcome_len > E.screencols) welcome_len = E.screencols;
+                int padding = (E.screencols - welcome_len) / 2;
+                if (padding) {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--) abAppend(ab, " ", 1);
+                abAppend(ab, welcome, welcome_len);
+            } else {
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while(padding--) abAppend(ab, " ", 1);
-            abAppend(ab, welcome, welcome_len);
         } else {
-            abAppend(ab, "~", 1);
+            int len = E.row[y].size;
+            if(len > E.screencols) len = E.screencols;
+            abAppend(ab, E.row[y].chars, len);
         }
+
+
         abAppend(ab, "\x1b[K", 3);//erase current line
         if (y < E.screenrows - 1) {
             abAppend(ab, "\r\n", 2);
@@ -292,6 +349,9 @@ void editorMoveCursor(int key) {
 void initEditor() {
     E.cx = 0; //Horizontal coordiate of the cursor
     E.cy = 0; //Vertical coordinate of the cusrsor
+    E.numrows = 0;
+    E.row = NULL;
+
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
@@ -329,9 +389,13 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-int main() {
+int main(int argc, char *argv[]) {
     enableRawMode();
     initEditor();
+    if (argc >= 2) {
+        editorOpen(argv[1]); //Opening and reading a file
+    }
+
 
     while (1) {
         editorRefreshScreen();
