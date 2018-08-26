@@ -1,12 +1,13 @@
 /*** includes ***/
 
-#include <ctype.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
 #include <termios.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/ioctl.h>
+
 #include <unistd.h>
 
 /*** defines ***/
@@ -15,9 +16,20 @@
 #define ABUF_INIT {NULL, 0}
 #define KILO_VERSION "0.0.1"
 
+enum editorKey {
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT ,
+    ARROW_UP ,
+    ARROW_DOWN,
+    DEL_KEY,
+    PAGE_UP,
+    PAGE_DOWN
+}; //No HOME, END keys, they don't work for my PC
+
 /*** data ***/
 
 struct editorConfig { //data about the default terminal
+    int cx, cy;
     int screenrows;
     int screencols;
     struct termios orig_termios; //original terminal configs
@@ -73,15 +85,53 @@ void enableRawMode() {
 
 /**
  * @brief Read a single key press
- * @return c The character read
+ * @return The character read
  */
-char editorReadKey() {
+int editorReadKey() {
     int nread;
     char c;
     while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
         if (nread == -1 && errno != EAGAIN) die("read");
     }
-    return c;
+
+    if(c == '\x1b') { // If it's an escape character, we read two more bytee
+        char seq[3]; //size 3 to handle longer escape sequences
+
+        if( read( STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if( read( STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+        if( seq[0] == '[' ) {
+            if( seq[1] >= '0' && seq[1] <= '9') {
+                if( read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if( seq[2] == '~' ) {
+                    switch (seq[1]) {
+                        case '3':
+                            return DEL_KEY; // <esc>[3~
+                        case '5':
+                            return  PAGE_UP; //<esc>[5~ is the esc seq for PAGE UP
+                        case '6':
+                            return PAGE_DOWN;// //<esc>[6~
+                    }
+                }
+            }
+            else {
+                switch (seq[1]) {
+                    case 'A':
+                        return ARROW_UP;
+                    case 'B':
+                        return ARROW_DOWN;
+                    case 'C':
+                        return ARROW_RIGHT;
+                    case 'D' :
+                        return ARROW_LEFT;
+                }
+            }
+        }
+
+        return '\x1b'; //return escape key
+    } else {
+        return c;
+    }
 }
 
 /**
@@ -156,7 +206,7 @@ void abFree(struct abuf *ab) {
 /*** output ***/
 
 /**
- * Draw each raw with a `tilda`, welcome message too, not every row
+ * Draw each row with a `tilda`, welcome message too, not every row
  * @param ab    The struct with char string
  */
 void editorDrawRows(struct abuf *ab) {
@@ -164,10 +214,16 @@ void editorDrawRows(struct abuf *ab) {
     for (y = 0; y < E.screenrows; y++) {
         if (y == E.screenrows / 3) {
             char welcome[80];
-            int welcomelen = snprintf(welcome, sizeof(welcome),
+            int welcome_len = snprintf(welcome, sizeof(welcome),
                                       "Kilo editor -- version %s", KILO_VERSION); //like sprintf, but n = MAX char
-            if (welcomelen > E.screencols) welcomelen = E.screencols;
-            abAppend(ab, welcome, welcomelen);
+            if (welcome_len > E.screencols) welcome_len = E.screencols;
+            int padding = (E.screencols - welcome_len) / 2;
+            if(padding) {
+                abAppend(ab, "~", 1);
+                padding--;
+            }
+            while(padding--) abAppend(ab, " ", 1);
+            abAppend(ab, welcome, welcome_len);
         } else {
             abAppend(ab, "~", 1);
         }
@@ -196,7 +252,10 @@ void editorRefreshScreen() {
 
     editorDrawRows(&ab);
 
-    abAppend(&ab, "\x1b[H", 3);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1); //the terminal index are 1-n not 0-n
+    abAppend(&ab, buf, strlen(buf));
+
     abAppend(&ab, "\x1b[?25h", 6); //reset hide cursor
 
     write(STDOUT_FILENO, ab.b, ab.len); //write what's in the buffer
@@ -207,9 +266,32 @@ void editorRefreshScreen() {
 /*** input ***/
 
 /**
+ * Move the cursor with WASD inputs
+ * @param key Key Press
+ */
+void editorMoveCursor(int key) {
+    switch (key) {
+        case ARROW_LEFT:
+            if(E.cx != 0)               { E.cx--; }
+            break;
+        case ARROW_RIGHT:
+            if(E.cx != E.screencols -1) { E.cx++; }
+            break;
+        case ARROW_UP:
+            if(E.cy != 0)               { E.cy--; }
+            break;
+        case ARROW_DOWN:
+            if(E.cy != E.screenrows -1) { E.cy++; }
+            break;
+    }
+}
+
+/**
  * Get window size to init editor
  */
 void initEditor() {
+    E.cx = 0; //Horizontal coordiate of the cursor
+    E.cy = 0; //Vertical coordinate of the cusrsor
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
@@ -217,15 +299,31 @@ void initEditor() {
  * Get each key and process it to do defined behaviour
  */
 void editorProcessKeypress() {
-    char c = editorReadKey();
+    int c = editorReadKey();
     switch (c) {
         case CTRL_KEY('q'):
             //clear screen and set cursor at 1,1 on exit
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
-
             exit(0);
             break;
+
+        case PAGE_UP:
+        case PAGE_DOWN:
+        {
+            int times = E.screenrows;
+            while (times--)
+                editorMoveCursor( c == PAGE_UP ? ARROW_UP: ARROW_DOWN);
+        }
+        break;
+
+        case ARROW_UP:
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
+            editorMoveCursor(c);
+            break;
+
     }
 }
 
